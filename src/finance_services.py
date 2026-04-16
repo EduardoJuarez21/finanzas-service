@@ -1395,7 +1395,9 @@ def get_finance_yearly_summary(year: int) -> dict:
         expense_by_month: dict[str, float] = {}
         for month in months:
             monthly_expenses = _list_monthly_expense_entries(conn, month)
-            expense_by_month[month] = sum(float(item["amount"]) for item in monthly_expenses)
+            expense_by_month[month] = sum(
+                float(item["amount"]) for item in monthly_expenses if not item.get("is_virtual")
+            )
 
     result = []
     cumulative_balance = 0.0
