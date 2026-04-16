@@ -1043,6 +1043,19 @@ def list_finance_installment_plans(active_only: bool = False) -> list[dict]:
                 """
             )
             rows = cur.fetchall()
+    from datetime import date as _date
+    today = _date.today()
+    current_ym = today.year * 12 + today.month
+
+    def _dynamic_months_remaining(end_month: str | None) -> int:
+        if not end_month:
+            return 0
+        try:
+            ey, em = map(int, end_month.split("-"))
+            return max(0, (ey * 12 + em) - current_ym + 1)
+        except Exception:
+            return 0
+
     return [
         {
             "id": row[0],
@@ -1050,8 +1063,8 @@ def list_finance_installment_plans(active_only: bool = False) -> list[dict]:
             "account_name": row[2],
             "monthly_payment": float(row[3]),
             "months_total": row[4],
-            "months_remaining": row[5],
-            "pending_total": float(row[6]),
+            "months_remaining": _dynamic_months_remaining(row[11]),
+            "pending_total": float(row[3]) * _dynamic_months_remaining(row[11]),
             "purchase_date": _date_to_iso(row[7]),
             "status": row[8],
             "created_at": _datetime_to_iso(row[9]),
@@ -1219,22 +1232,39 @@ def get_finance_dashboard(month: str) -> dict:
                 select coalesce(sum(monthly_payment), 0)
                 from {TBL_INSTALLMENT_PLANS}
                 where status = 'active'
-                  and months_remaining > 0
                   and end_month >= %s
+                  and to_char(date_trunc('month', created_at), 'YYYY-MM') <= %s
                 """,
-                (month_value,),
+                (month_value, month_value),
             )
             installment_commitment = float(cur.fetchone()[0] or 0)
 
             cur.execute(
                 f"""
-                select count(*), coalesce(sum(months_remaining), 0), coalesce(sum(pending_total), 0)
+                select
+                  count(*),
+                  coalesce(sum(
+                    greatest(0,
+                      (extract(year from age((end_month || '-01')::date,
+                        (%s || '-01')::date)) * 12
+                      + extract(month from age((end_month || '-01')::date,
+                        (%s || '-01')::date)))::int + 1
+                    )
+                  ), 0),
+                  coalesce(sum(
+                    monthly_payment * greatest(0,
+                      (extract(year from age((end_month || '-01')::date,
+                        (%s || '-01')::date)) * 12
+                      + extract(month from age((end_month || '-01')::date,
+                        (%s || '-01')::date)))::int + 1
+                    )
+                  ), 0)
                 from {TBL_INSTALLMENT_PLANS}
                 where status = 'active'
-                  and months_remaining > 0
                   and end_month >= %s
+                  and to_char(date_trunc('month', created_at), 'YYYY-MM') <= %s
                 """,
-                (month_value,),
+                (month_value, month_value, month_value, month_value, month_value, month_value),
             )
             msi_row = cur.fetchone()
 
@@ -1262,7 +1292,6 @@ def get_finance_dashboard(month: str) -> dict:
             from {TBL_INSTALLMENT_PLANS} p
             join {TBL_ACCOUNTS} a on a.id = p.account_id
             where p.status = 'active'
-              and p.months_remaining > 0
               and p.end_month >= %s
               and to_char(date_trunc('month', p.created_at), 'YYYY-MM') <= %s
             group by a.name
