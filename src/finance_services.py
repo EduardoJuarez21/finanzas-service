@@ -1076,13 +1076,43 @@ def list_finance_installment_plans(active_only: bool = False) -> list[dict]:
     ]
 
 
+def _compute_end_month(account_name: str, months_remaining: int) -> str:
+    """Calcula end_month según el cutoff_day de la cuenta.
+
+    Si hoy ya pasó el corte, el primer cargo cae el mes siguiente;
+    si aún no ha cortado, cae este mismo mes.
+    """
+    with _db_conn() as conn:
+        if conn is None:
+            raise ValueError("DATABASE_URL not set")
+        with conn.cursor() as cur:
+            cur.execute(
+                f"select cutoff_day from {TBL_ACCOUNTS} where lower(name) = lower(%s) and is_active = true",
+                (account_name,),
+            )
+            row = cur.fetchone()
+    cutoff_day: int | None = int(row[0]) if row and row[0] else None
+
+    today = date.today()
+    if cutoff_day is not None and today.day > cutoff_day:
+        # La tarjeta ya cortó → primer pago el mes que viene
+        first_payment = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
+    else:
+        first_payment = today.replace(day=1)
+
+    # end_month = primer_pago + (months_remaining - 1) meses
+    month_offset = months_remaining - 1
+    year = first_payment.year + (first_payment.month - 1 + month_offset) // 12
+    month = (first_payment.month - 1 + month_offset) % 12 + 1
+    return f"{year:04d}-{month:02d}"
+
+
 def create_finance_installment_plan(payload: dict) -> dict:
     purchase_name = (payload.get("purchase_name") or "").strip()
     account_name = (payload.get("account_name") or "").strip()
     monthly_payment = _require_positive_amount(payload.get("monthly_payment"), "monthly_payment")
     months_remaining = _require_int(payload.get("months_remaining"), "months_remaining", minimum=0)
     pending_total = _require_positive_amount(payload.get("pending_total"), "pending_total")
-    end_month = _require_month(payload.get("end_month") or "")
     category_name = (payload.get("category_name") or "").strip() or None
     months_total = payload.get("months_total")
     purchase_date = _optional_date(payload.get("purchase_date"))
@@ -1101,6 +1131,11 @@ def create_finance_installment_plan(payload: dict) -> dict:
 
     account_id = _lookup_id_by_name(TBL_ACCOUNTS, account_name)
     category_id = _lookup_id_by_name(TBL_EXPENSE_CATEGORIES, category_name) if category_name else None
+
+    # end_month se calcula automáticamente según el cutoff_day de la cuenta;
+    # si el cliente lo manda explícitamente se respeta.
+    raw_end_month = (payload.get("end_month") or "").strip()
+    end_month = _require_month(raw_end_month) if raw_end_month else _compute_end_month(account_name, months_remaining)
 
     with _db_conn() as conn:
         if conn is None:
