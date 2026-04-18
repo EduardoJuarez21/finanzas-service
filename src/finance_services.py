@@ -370,6 +370,60 @@ def list_finance_catalogs() -> dict:
     }
 
 
+def create_finance_expense_category(payload: dict) -> dict:
+    name = (payload.get("name") or "").strip()
+    kind = (payload.get("kind") or "variable").strip().lower()
+
+    if not name:
+        raise ValueError("Falta name.")
+    if kind not in {"variable", "fixed", "debt"}:
+        raise ValueError("kind invalido. Usa variable, fixed o debt.")
+
+    with _db_conn() as conn:
+        if conn is None:
+            raise ValueError("DATABASE_URL not set")
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                insert into {TBL_EXPENSE_CATEGORIES} (name, kind)
+                values (%s, %s)
+                on conflict (name) do nothing
+                returning id, name, kind, created_at
+                """,
+                (name, kind),
+            )
+            row = cur.fetchone()
+            conn.commit()
+    if not row:
+        raise ValueError(f"La categoría '{name}' ya existe.")
+    return {"id": row[0], "name": row[1], "kind": row[2], "created_at": _datetime_to_iso(row[3])}
+
+
+def deactivate_finance_expense_category(payload: dict) -> dict:
+    name = (payload.get("name") or "").strip()
+    if not name:
+        raise ValueError("Falta name.")
+
+    with _db_conn() as conn:
+        if conn is None:
+            raise ValueError("DATABASE_URL not set")
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                update {TBL_EXPENSE_CATEGORIES}
+                set is_active = false
+                where lower(name) = lower(%s) and is_active = true
+                returning id, name
+                """,
+                (name,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError(f"No existe la categoría activa '{name}'.")
+            conn.commit()
+    return {"id": row[0], "name": row[1], "is_active": False}
+
+
 def list_finance_expenses(month: str | None = None, limit: int = 100) -> list[dict]:
     limit_value = max(1, min(int(limit or 100), 500))
     if month:

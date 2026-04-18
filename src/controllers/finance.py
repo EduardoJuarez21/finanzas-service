@@ -5,6 +5,8 @@ from flask import Blueprint, jsonify, request
 from src.finance_services import (
     create_finance_account_cut_event,
     create_finance_expense,
+    create_finance_expense_category,
+    deactivate_finance_expense_category,
     update_finance_expense,
     create_finance_fixed_expense,
     create_finance_fixed_income,
@@ -36,6 +38,24 @@ def _json_payload() -> dict:
 @finance_bp.get("/finance/catalogs")
 def get_finance_catalogs():
     return jsonify({"status": "ok", **list_finance_catalogs()}), 200
+
+
+@finance_bp.post("/finance/expense-categories")
+def finance_expense_categories_create():
+    try:
+        item = create_finance_expense_category(_json_payload())
+    except ValueError as exc:
+        return jsonify({"status": "error", "error": str(exc)}), 400
+    return jsonify({"status": "ok", "item": item}), 201
+
+
+@finance_bp.post("/finance/expense-categories/delete")
+def finance_expense_categories_delete():
+    try:
+        item = deactivate_finance_expense_category(_json_payload())
+    except ValueError as exc:
+        return jsonify({"status": "error", "error": str(exc)}), 400
+    return jsonify({"status": "ok", "item": item}), 200
 
 
 @finance_bp.get("/finance/dashboard")
