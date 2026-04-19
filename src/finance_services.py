@@ -1149,8 +1149,10 @@ def _compute_end_month(account_name: str, months_remaining: int) -> str:
 
     today = date.today()
     if cutoff_day is not None and today.day > cutoff_day:
-        # La tarjeta ya cortó → primer pago el mes que viene
-        first_payment = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
+        # La tarjeta ya cortó → la compra cae en el siguiente estado de cuenta,
+        # que se paga el mes después → primer pago = 2 meses adelante
+        m1 = (today.replace(day=1) + timedelta(days=32)).replace(day=1)
+        first_payment = (m1 + timedelta(days=32)).replace(day=1)
     else:
         first_payment = today.replace(day=1)
 
@@ -1159,6 +1161,119 @@ def _compute_end_month(account_name: str, months_remaining: int) -> str:
     year = first_payment.year + (first_payment.month - 1 + month_offset) // 12
     month = (first_payment.month - 1 + month_offset) % 12 + 1
     return f"{year:04d}-{month:02d}"
+
+
+def update_finance_installment_plan(plan_id: int, payload: dict) -> dict:
+    fields: list[str] = []
+    values: list = []
+
+    if "purchase_name" in payload:
+        v = (payload["purchase_name"] or "").strip()
+        if not v:
+            raise ValueError("purchase_name no puede estar vacío.")
+        fields.append("purchase_name = %s")
+        values.append(v)
+
+    if "monthly_payment" in payload:
+        fields.append("monthly_payment = %s")
+        values.append(_require_positive_amount(payload["monthly_payment"], "monthly_payment"))
+
+    if "months_remaining" in payload:
+        fields.append("months_remaining = %s")
+        values.append(_require_int(payload["months_remaining"], "months_remaining", minimum=0))
+
+    if "months_total" in payload:
+        mt = payload["months_total"]
+        fields.append("months_total = %s")
+        values.append(_require_int(mt, "months_total", minimum=1) if mt not in (None, "") else None)
+
+    if "pending_total" in payload:
+        fields.append("pending_total = %s")
+        values.append(_require_positive_amount(payload["pending_total"], "pending_total"))
+
+    if "end_month" in payload:
+        fields.append("end_month = %s")
+        values.append(_require_month(payload["end_month"]))
+
+    if "status" in payload:
+        s = (payload["status"] or "").strip().lower()
+        if s not in {"active", "closed"}:
+            raise ValueError("status invalido. Usa active o closed.")
+        fields.append("status = %s")
+        values.append(s)
+
+    if "purchase_date" in payload:
+        fields.append("purchase_date = %s")
+        values.append(_optional_date(payload["purchase_date"]))
+
+    if "category_name" in payload:
+        cat = (payload["category_name"] or "").strip() or None
+        category_id = _lookup_id_by_name(TBL_EXPENSE_CATEGORIES, cat) if cat else None
+        fields.append("category_id = %s")
+        values.append(category_id)
+
+    if not fields:
+        raise ValueError("No hay campos para actualizar.")
+
+    fields.append("updated_at = now()")
+    values.append(plan_id)
+
+    with _db_conn() as conn:
+        if conn is None:
+            raise ValueError("DATABASE_URL not set")
+        with conn.cursor() as cur:
+            cur.execute(
+                f"update {TBL_INSTALLMENT_PLANS} set {', '.join(fields)} where id = %s returning id",
+                values,
+            )
+            if cur.fetchone() is None:
+                raise ValueError(f"Plan {plan_id} no encontrado.")
+            conn.commit()
+
+    with _db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                select p.id, p.purchase_name, a.name, p.monthly_payment, p.months_total,
+                       p.months_remaining, p.pending_total, p.purchase_date, p.status,
+                       p.created_at, p.updated_at, p.end_month, c.name
+                from {TBL_INSTALLMENT_PLANS} p
+                join {TBL_ACCOUNTS} a on a.id = p.account_id
+                left join {TBL_EXPENSE_CATEGORIES} c on c.id = p.category_id
+                where p.id = %s
+                """,
+                (plan_id,),
+            )
+            row = cur.fetchone()
+
+    from datetime import date as _date
+    today = _date.today()
+    current_ym = today.year * 12 + today.month
+
+    def _dyn_remaining(end_month):
+        if not end_month:
+            return 0
+        try:
+            ey, em = map(int, end_month.split("-"))
+            return max(0, (ey * 12 + em) - current_ym + 1)
+        except Exception:
+            return 0
+
+    return {
+        "id": row[0],
+        "purchase_name": row[1],
+        "account_name": row[2],
+        "monthly_payment": float(row[3]),
+        "months_total": row[4],
+        "months_remaining": _dyn_remaining(row[11]),
+        "pending_total": float(row[3]) * _dyn_remaining(row[11]),
+        "end_month": row[11],
+        "purchase_date": _date_to_iso(row[7]),
+        "status": row[8],
+        "created_at": _datetime_to_iso(row[9]),
+        "updated_at": _datetime_to_iso(row[10]),
+        "category_name": row[12],
+    }
 
 
 def create_finance_installment_plan(payload: dict) -> dict:

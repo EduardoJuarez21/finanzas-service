@@ -12,6 +12,7 @@ from src.finance_services import (
     create_finance_fixed_income,
     create_finance_income,
     create_finance_installment_plan,
+    update_finance_installment_plan,
     deactivate_finance_fixed_expense,
     deactivate_finance_fixed_income,
     get_finance_dashboard,
@@ -169,6 +170,15 @@ def finance_installment_plans():
     except ValueError as exc:
         return jsonify({"status": "error", "error": str(exc)}), 400
     return jsonify({"status": "ok", "item": item}), 201
+
+
+@finance_bp.patch("/finance/installment-plans/<int:plan_id>")
+def finance_installment_plans_update(plan_id: int):
+    try:
+        item = update_finance_installment_plan(plan_id, _json_payload())
+    except ValueError as exc:
+        return jsonify({"status": "error", "error": str(exc)}), 400
+    return jsonify({"status": "ok", "item": item}), 200
 
 
 @finance_bp.post("/finance/expenses/<int:expense_id>/update")
