@@ -1522,10 +1522,19 @@ def get_finance_dashboard(month: str) -> dict:
         {"category_name": name, "amount": amount}
         for name, amount in sorted(expense_by_category_totals.items(), key=lambda item: (-item[1], item[0]))
     ]
+    recent_captured_expenses = sorted(
+        (item for item in monthly_expenses if item.get("entry_type") == "expense"),
+        key=lambda item: (
+            item.get("created_at") or "",
+            str(item.get("id") or ""),
+        ),
+        reverse=True,
+    )
     recent_expenses = [
         {
             "id": item["id"],
             "date": item["date"],
+            "created_at": item.get("created_at"),
             "amount": item["amount"],
             "description": item["description"],
             "account_name": item["account_name"],
@@ -1533,7 +1542,7 @@ def get_finance_dashboard(month: str) -> dict:
             "entry_type": item.get("entry_type"),
             "payment_status": item.get("payment_status"),
         }
-        for item in monthly_expenses[:10]
+        for item in recent_captured_expenses[:10]
     ]
 
     balance = total_income - total_expense - installment_commitment
