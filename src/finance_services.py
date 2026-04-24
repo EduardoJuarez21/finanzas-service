@@ -121,6 +121,19 @@ def _shift_month(month: str, delta: int) -> str:
     return f"{year:04d}-{month_value:02d}"
 
 
+def _month_index(month: str) -> int:
+    year, month_value = map(int, month.split("-"))
+    return year * 12 + month_value
+
+
+def _months_between_inclusive(start_month: str, end_month: str) -> int:
+    return max(0, _month_index(end_month) - _month_index(start_month) + 1)
+
+
+def _max_month(month_a: str, month_b: str) -> str:
+    return month_a if _month_index(month_a) >= _month_index(month_b) else month_b
+
+
 def _date_to_iso(value) -> str | None:
     if value is None:
         return None
@@ -175,8 +188,84 @@ def _load_cut_events_by_account(conn, until_date: str | None = None) -> dict[str
 
     grouped: dict[str, list[date]] = {}
     for account_name, cut_date in rows:
-        grouped.setdefault(account_name, []).append(cut_date)
+        grouped.setdefault(account_name, []).append(_coerce_date(cut_date))
     return grouped
+
+
+def _coerce_date(value) -> date | None:
+    if value is None:
+        return None
+    if hasattr(value, "date") and not isinstance(value, str):
+        try:
+            return value.date()
+        except Exception:
+            pass
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        return date.fromisoformat(value[:10])
+    return date.fromisoformat(str(value)[:10])
+
+
+def _installment_anchor_date(purchase_date, created_at) -> date:
+    return _coerce_date(purchase_date) or _coerce_date(created_at) or date.today()
+
+
+def _installment_first_payment_month(
+    purchase_date,
+    account_name: str,
+    account_type: str | None,
+    cutoff_day: int | None,
+    cut_events_by_account: dict[str, list[date]],
+) -> str:
+    anchor_date = _coerce_date(purchase_date) or date.today()
+    purchase_month = anchor_date.strftime("%Y-%m")
+    if not _is_card_account_type(account_type):
+        return purchase_month
+
+    cut_dates = cut_events_by_account.get(account_name, [])
+    latest_cut = None
+    for cut_date in cut_dates:
+        if cut_date <= anchor_date:
+            latest_cut = cut_date
+        else:
+            break
+
+    if latest_cut and latest_cut.strftime("%Y-%m") == purchase_month and anchor_date > latest_cut:
+        return _shift_month(purchase_month, 1)
+    if cutoff_day and anchor_date.day > int(cutoff_day):
+        return _shift_month(purchase_month, 1)
+    return purchase_month
+
+
+def _installment_term_months(months_total, stored_months_remaining, fallback_end_month: str | None, first_payment_month: str) -> int:
+    if months_total not in (None, ""):
+        return int(months_total)
+    if stored_months_remaining not in (None, ""):
+        return int(stored_months_remaining)
+    if fallback_end_month:
+        return _months_between_inclusive(first_payment_month, fallback_end_month)
+    return 0
+
+
+def _installment_end_month(first_payment_month: str, term_months: int, fallback_end_month: str | None = None) -> str | None:
+    if term_months > 0:
+        return _shift_month(first_payment_month, term_months - 1)
+    return fallback_end_month
+
+
+def _installment_months_remaining(first_payment_month: str, end_month: str | None, reference_month: str) -> int:
+    if not end_month:
+        return 0
+    effective_start = _max_month(first_payment_month, reference_month)
+    return _months_between_inclusive(effective_start, end_month)
+
+
+def _installment_active_in_month(first_payment_month: str, end_month: str | None, month: str) -> bool:
+    if not end_month:
+        return False
+    month_idx = _month_index(month)
+    return _month_index(first_payment_month) <= month_idx <= _month_index(end_month)
 
 
 def _report_month_for_expense(expense_date, account_name: str, account_type: str | None, cut_events_by_account: dict[str, list[date]]) -> str:
@@ -1067,67 +1156,109 @@ def upsert_finance_fixed_expense_payment(payload: dict) -> dict:
     }
 
 
-def list_finance_installment_plans(active_only: bool = False) -> list[dict]:
+def _fetch_installment_plan_rows(conn, active_only: bool = False):
     where = "where p.status = 'active'" if active_only else ""
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            select
+              p.id,
+              p.purchase_name,
+              a.name as account_name,
+              p.monthly_payment,
+              p.months_total,
+              p.months_remaining,
+              p.pending_total,
+              p.purchase_date,
+              p.status,
+              p.created_at,
+              p.updated_at,
+              p.end_month,
+              c.name as category_name,
+              a.account_type,
+              a.cutoff_day
+            from {TBL_INSTALLMENT_PLANS} p
+            join {TBL_ACCOUNTS} a on a.id = p.account_id
+            left join {TBL_EXPENSE_CATEGORIES} c on c.id = p.category_id
+            {where}
+            order by p.status asc, p.created_at desc
+            """
+        )
+        rows = cur.fetchall()
+    return rows
+
+
+def _serialize_installment_plan_row(
+    row,
+    cut_events_by_account: dict[str, list[date]],
+    reference_month: str | None = None,
+) -> dict:
+    current_month = reference_month or date.today().strftime("%Y-%m")
+    anchor_date = _installment_anchor_date(row[7], row[9])
+    first_payment_month = _installment_first_payment_month(
+        anchor_date,
+        row[2],
+        row[13],
+        row[14],
+        cut_events_by_account,
+    )
+    term_months = _installment_term_months(row[4], row[5], row[11], first_payment_month)
+    end_month = _installment_end_month(first_payment_month, term_months, row[11])
+    months_remaining = (
+        _installment_months_remaining(first_payment_month, end_month, current_month)
+        if row[8] == "active"
+        else 0
+    )
+    return {
+        "id": row[0],
+        "purchase_name": row[1],
+        "account_name": row[2],
+        "monthly_payment": float(row[3]),
+        "months_total": term_months or None,
+        "months_remaining": months_remaining,
+        "pending_total": float(row[3]) * months_remaining,
+        "purchase_date": _date_to_iso(anchor_date),
+        "status": row[8],
+        "created_at": _datetime_to_iso(row[9]),
+        "updated_at": _datetime_to_iso(row[10]),
+        "end_month": end_month,
+        "first_payment_month": first_payment_month,
+        "category_name": row[12],
+    }
+
+
+def list_finance_installment_plans(active_only: bool = False) -> list[dict]:
     with _db_conn() as conn:
         if conn is None:
             return []
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                select
-                  p.id,
-                  p.purchase_name,
-                  a.name as account_name,
-                  p.monthly_payment,
-                  p.months_total,
-                  p.months_remaining,
-                  p.pending_total,
-                  p.purchase_date,
-                  p.status,
-                  p.created_at,
-                  p.updated_at,
-                  p.end_month,
-                  c.name as category_name
-                from {TBL_INSTALLMENT_PLANS} p
-                join {TBL_ACCOUNTS} a on a.id = p.account_id
-                left join {TBL_EXPENSE_CATEGORIES} c on c.id = p.category_id
-                {where}
-                order by p.status asc, p.created_at desc
-                """
-            )
-            rows = cur.fetchall()
-    from datetime import date as _date
-    today = _date.today()
-    current_ym = today.year * 12 + today.month
-
-    def _dynamic_months_remaining(end_month: str | None) -> int:
-        if not end_month:
-            return 0
-        try:
-            ey, em = map(int, end_month.split("-"))
-            return max(0, (ey * 12 + em) - current_ym + 1)
-        except Exception:
-            return 0
+        rows = _fetch_installment_plan_rows(conn, active_only=active_only)
+        cut_events_by_account = _load_cut_events_by_account(conn)
 
     return [
-        {
-            "id": row[0],
-            "purchase_name": row[1],
-            "account_name": row[2],
-            "monthly_payment": float(row[3]),
-            "months_total": row[4],
-            "months_remaining": _dynamic_months_remaining(row[11]),
-            "pending_total": float(row[3]) * _dynamic_months_remaining(row[11]),
-            "purchase_date": _date_to_iso(row[7]),
-            "status": row[8],
-            "created_at": _datetime_to_iso(row[9]),
-            "updated_at": _datetime_to_iso(row[10]),
-            "end_month": row[11],
-            "category_name": row[12],
-        }
+        _serialize_installment_plan_row(row, cut_events_by_account)
         for row in rows
     ]
+
+
+def _resolve_installment_end_month(
+    account_name: str,
+    account_type: str | None,
+    cutoff_day: int | None,
+    purchase_date,
+    created_at,
+    term_months: int,
+    cut_events_by_account: dict[str, list[date]],
+) -> tuple[str | None, str]:
+    anchor_date = _installment_anchor_date(purchase_date, created_at)
+    first_payment_month = _installment_first_payment_month(
+        anchor_date,
+        account_name,
+        account_type,
+        cutoff_day,
+        cut_events_by_account,
+    )
+    end_month = _installment_end_month(first_payment_month, term_months)
+    return end_month, first_payment_month
 
 
 def _compute_end_month(account_name: str, months_remaining: int) -> str:
@@ -1348,6 +1479,177 @@ def create_finance_installment_plan(payload: dict) -> dict:
     }
 
 
+def create_finance_installment_plan(payload: dict) -> dict:
+    purchase_name = (payload.get("purchase_name") or "").strip()
+    account_name = (payload.get("account_name") or "").strip()
+    monthly_payment = _require_positive_amount(payload.get("monthly_payment"), "monthly_payment")
+    months_remaining = _require_int(payload.get("months_remaining"), "months_remaining", minimum=0)
+    category_name = (payload.get("category_name") or "").strip() or None
+    months_total = payload.get("months_total")
+    purchase_date = _optional_date(payload.get("purchase_date")) or date.today().isoformat()
+    status = (payload.get("status") or "active").strip().lower()
+
+    if not purchase_name:
+        raise ValueError("Falta purchase_name.")
+    if not account_name:
+        raise ValueError("Falta account_name.")
+    if status not in {"active", "closed"}:
+        raise ValueError("status invalido. Usa active o closed.")
+
+    months_total_value = _require_int(months_total, "months_total", minimum=1) if months_total not in (None, "") else months_remaining
+
+    with _db_conn() as conn:
+        if conn is None:
+            raise ValueError("DATABASE_URL not set")
+        account_id = _lookup_id_by_name(TBL_ACCOUNTS, account_name)
+        category_id = _lookup_id_by_name(TBL_EXPENSE_CATEGORIES, category_name) if category_name else None
+
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                select a.name, a.account_type, a.cutoff_day
+                from {TBL_ACCOUNTS} a
+                where a.id = %s
+                """,
+                (account_id,),
+            )
+            account_row = cur.fetchone()
+
+        cut_events_by_account = _load_cut_events_by_account(conn)
+        end_month, _ = _resolve_installment_end_month(
+            account_row[0],
+            account_row[1],
+            account_row[2],
+            purchase_date,
+            None,
+            months_total_value,
+            cut_events_by_account,
+        )
+        pending_total = monthly_payment * months_total_value
+
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                insert into {TBL_INSTALLMENT_PLANS}
+                (purchase_name, account_id, monthly_payment, months_total, months_remaining, pending_total, purchase_date, status, end_month, category_id)
+                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                returning id
+                """,
+                (
+                    purchase_name,
+                    account_id,
+                    monthly_payment,
+                    months_total_value,
+                    months_total_value,
+                    pending_total,
+                    purchase_date,
+                    status,
+                    end_month,
+                    category_id,
+                ),
+            )
+            plan_id = cur.fetchone()[0]
+            conn.commit()
+
+        row = next(item for item in _fetch_installment_plan_rows(conn, active_only=False) if item[0] == plan_id)
+        return _serialize_installment_plan_row(row, cut_events_by_account)
+
+
+def update_finance_installment_plan(plan_id: int, payload: dict) -> dict:
+    with _db_conn() as conn:
+        if conn is None:
+            raise ValueError("DATABASE_URL not set")
+
+        current_row = next((row for row in _fetch_installment_plan_rows(conn, active_only=False) if row[0] == plan_id), None)
+        if current_row is None:
+            raise ValueError(f"Plan {plan_id} no encontrado.")
+
+        purchase_name = (payload.get("purchase_name") or current_row[1]).strip()
+        if not purchase_name:
+            raise ValueError("purchase_name no puede estar vacio.")
+
+        monthly_payment = (
+            _require_positive_amount(payload["monthly_payment"], "monthly_payment")
+            if "monthly_payment" in payload
+            else float(current_row[3])
+        )
+        months_total_value = current_row[4]
+        if "months_total" in payload:
+            mt = payload["months_total"]
+            months_total_value = _require_int(mt, "months_total", minimum=1) if mt not in (None, "") else None
+
+        months_remaining_value = (
+            _require_int(payload["months_remaining"], "months_remaining", minimum=0)
+            if "months_remaining" in payload
+            else int(current_row[5] or 0)
+        )
+        term_months = months_total_value or months_remaining_value
+        if term_months < 0:
+            raise ValueError("months_remaining invalido.")
+
+        purchase_date = (
+            _optional_date(payload["purchase_date"])
+            if "purchase_date" in payload
+            else _date_to_iso(current_row[7])
+        ) or _date_to_iso(_installment_anchor_date(current_row[7], current_row[9]))
+        status = (payload.get("status") or current_row[8] or "active").strip().lower()
+        if status not in {"active", "closed"}:
+            raise ValueError("status invalido. Usa active o closed.")
+
+        category_name = current_row[12]
+        if "category_name" in payload:
+            category_name = (payload["category_name"] or "").strip() or None
+        category_id = _lookup_id_by_name(TBL_EXPENSE_CATEGORIES, category_name) if category_name else None
+
+        cut_events_by_account = _load_cut_events_by_account(conn)
+        end_month, _ = _resolve_installment_end_month(
+            current_row[2],
+            current_row[13],
+            current_row[14],
+            purchase_date,
+            current_row[9],
+            term_months,
+            cut_events_by_account,
+        )
+        pending_total = monthly_payment * term_months
+
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                update {TBL_INSTALLMENT_PLANS}
+                set purchase_name = %s,
+                    monthly_payment = %s,
+                    months_total = %s,
+                    months_remaining = %s,
+                    pending_total = %s,
+                    purchase_date = %s,
+                    status = %s,
+                    end_month = %s,
+                    category_id = %s,
+                    updated_at = now()
+                where id = %s
+                returning id
+                """,
+                (
+                    purchase_name,
+                    monthly_payment,
+                    term_months,
+                    term_months,
+                    pending_total,
+                    purchase_date,
+                    status,
+                    end_month,
+                    category_id,
+                    plan_id,
+                ),
+            )
+            cur.fetchone()
+            conn.commit()
+
+        row = next(item for item in _fetch_installment_plan_rows(conn, active_only=False) if item[0] == plan_id)
+        return _serialize_installment_plan_row(row, cut_events_by_account)
+
+
 def upsert_finance_account_settings(payload: dict) -> dict:
     account_name = (payload.get("account_name") or "").strip()
     account_type = (payload.get("account_type") or "").strip().lower()
@@ -1413,6 +1715,11 @@ def get_finance_dashboard(month: str) -> dict:
                 "recent_expenses": [],
             }
         monthly_expenses = _list_monthly_expense_entries(conn, month_value)
+        cut_events_by_account = _load_cut_events_by_account(conn)
+        active_installment_plans = [
+            _serialize_installment_plan_row(row, cut_events_by_account, reference_month=month_value)
+            for row in _fetch_installment_plan_rows(conn, active_only=True)
+        ]
 
         with conn.cursor() as cur:
             cur.execute(
@@ -1431,52 +1738,21 @@ def get_finance_dashboard(month: str) -> dict:
             total_fixed_income = float(cur.fetchone()[0] or 0)
             total_income += total_fixed_income
 
-            cur.execute(
-                f"""
-                select coalesce(sum(monthly_payment), 0)
-                from {TBL_INSTALLMENT_PLANS}
-                where status = 'active'
-                  and end_month >= %s
-                  and to_char(date_trunc('month', created_at), 'YYYY-MM') <= %s
-                """,
-                (month_value, month_value),
-            )
-            installment_commitment = float(cur.fetchone()[0] or 0)
-
-            cur.execute(
-                f"""
-                select
-                  count(*),
-                  coalesce(sum(
-                    greatest(0,
-                      (extract(year from age((end_month || '-01')::date,
-                        (%s || '-01')::date)) * 12
-                      + extract(month from age((end_month || '-01')::date,
-                        (%s || '-01')::date)))::int + 1
-                    )
-                  ), 0),
-                  coalesce(sum(
-                    monthly_payment * greatest(0,
-                      (extract(year from age((end_month || '-01')::date,
-                        (%s || '-01')::date)) * 12
-                      + extract(month from age((end_month || '-01')::date,
-                        (%s || '-01')::date)))::int + 1
-                    )
-                  ), 0)
-                from {TBL_INSTALLMENT_PLANS}
-                where status = 'active'
-                  and end_month >= %s
-                  and to_char(date_trunc('month', created_at), 'YYYY-MM') <= %s
-                """,
-                (month_value, month_value, month_value, month_value, month_value, month_value),
-            )
-            msi_row = cur.fetchone()
-
     total_expense = sum(item["amount"] for item in monthly_expenses if not item.get("is_virtual"))
     fixed_commitment = sum(
         item["amount"]
         for item in monthly_expenses
         if item.get("entry_type") == "fixed" and item.get("payment_status") != "paid" and not item.get("is_virtual")
+    )
+    installment_commitment = sum(
+        float(item["monthly_payment"])
+        for item in active_installment_plans
+        if _installment_active_in_month(item["first_payment_month"], item["end_month"], month_value)
+    )
+    msi_row = (
+        len(active_installment_plans),
+        sum(int(item["months_remaining"] or 0) for item in active_installment_plans),
+        sum(float(item["pending_total"] or 0) for item in active_installment_plans),
     )
 
     expense_by_account_totals: dict[str, float] = {}
@@ -1489,23 +1765,10 @@ def get_finance_dashboard(month: str) -> dict:
         if item.get("is_virtual"):
             virtual_accounts.add(item["account_name"])
 
-    with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            select a.name, coalesce(sum(p.monthly_payment), 0) as monthly_total
-            from {TBL_INSTALLMENT_PLANS} p
-            join {TBL_ACCOUNTS} a on a.id = p.account_id
-            where p.status = 'active'
-              and p.end_month >= %s
-              and to_char(date_trunc('month', p.created_at), 'YYYY-MM') <= %s
-            group by a.name
-            """,
-            (month_value, month_value),
-        )
-        installment_by_account_rows = cur.fetchall()
-
-    for account_name, monthly_total in installment_by_account_rows:
-        msi_by_account_totals[account_name] = float(monthly_total or 0)
+    for plan in active_installment_plans:
+        if not _installment_active_in_month(plan["first_payment_month"], plan["end_month"], month_value):
+            continue
+        msi_by_account_totals[plan["account_name"]] = msi_by_account_totals.get(plan["account_name"], 0.0) + float(plan["monthly_payment"] or 0)
 
     all_accounts = set(expense_by_account_totals) | set(msi_by_account_totals)
     expense_by_account = [
@@ -1571,6 +1834,11 @@ def get_finance_yearly_summary(year: int) -> dict:
     with _db_conn() as conn:
         if conn is None:
             return {"year": year, "months": []}
+        cut_events_by_account = _load_cut_events_by_account(conn)
+        active_installment_plans = [
+            _serialize_installment_plan_row(row, cut_events_by_account, reference_month=months[-1])
+            for row in _fetch_installment_plan_rows(conn, active_only=True)
+        ]
         with conn.cursor() as cur:
             # Fixed incomes (same amount every month)
             cur.execute(
@@ -1591,55 +1859,20 @@ def get_finance_yearly_summary(year: int) -> dict:
             )
             income_by_month = {row[0]: float(row[1]) for row in cur.fetchall()}
 
-            # MSI commitment per month
-            cur.execute(
-                f"""
-                select end_month_label, coalesce(sum(monthly_payment), 0)
-                from (
-                    select monthly_payment,
-                           generate_series(
-                               date_trunc('month', created_at)::date,
-                               (end_month || '-01')::date,
-                               '1 month'
-                           )::date as month_date,
-                           end_month as end_month_label
-                    from {TBL_INSTALLMENT_PLANS}
-                    where status = 'active' and months_remaining > 0
-                ) sub
-                where to_char(month_date, 'YYYY') = %s::text
-                group by to_char(month_date, 'YYYY-MM'), end_month_label
-                """,
-                (year,),
-            )
-            # Re-query simpler: sum MSI per calendar month of that year
-            cur.execute(
-                f"""
-                select m.month_label, coalesce(sum(p.monthly_payment), 0)
-                from (
-                    select to_char(generate_series(
-                        make_date(%s, 1, 1),
-                        make_date(%s, 12, 1),
-                        '1 month'
-                    ), 'YYYY-MM') as month_label
-                ) m
-                left join {TBL_INSTALLMENT_PLANS} p
-                  on p.status = 'active'
-                 and p.months_remaining > 0
-                 and p.end_month >= m.month_label
-                 and to_char(date_trunc('month', p.created_at), 'YYYY-MM') <= m.month_label
-                group by m.month_label
-                order by m.month_label
-                """,
-                (year, year),
-            )
-            msi_by_month = {row[0]: float(row[1]) for row in cur.fetchall()}
-
         expense_by_month: dict[str, float] = {}
         for month in months:
             monthly_expenses = _list_monthly_expense_entries(conn, month)
             expense_by_month[month] = sum(
                 float(item["amount"]) for item in monthly_expenses if not item.get("is_virtual")
             )
+        msi_by_month = {
+            month: sum(
+                float(plan["monthly_payment"] or 0)
+                for plan in active_installment_plans
+                if _installment_active_in_month(plan["first_payment_month"], plan["end_month"], month)
+            )
+            for month in months
+        }
 
     result = []
     cumulative_balance = 0.0
