@@ -1,5 +1,5 @@
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from src.db import _db_conn
 
@@ -171,7 +171,7 @@ def _uses_two_month_post_cutover(account_name: str | None) -> bool:
     return normalized in {"heb", "stori"}
 
 
-def _load_cut_events_by_account(conn, until_date: str | None = None) -> dict[str, list[date]]:
+def _load_cut_events_by_account(conn, until_date: str | None = None) -> dict[str, list[dict]]:
     where = ""
     params: list = []
     if until_date:
@@ -181,7 +181,7 @@ def _load_cut_events_by_account(conn, until_date: str | None = None) -> dict[str
     with conn.cursor() as cur:
         cur.execute(
             f"""
-            select a.name, ace.cut_date
+            select a.name, ace.cut_date, ace.created_at
             from {TBL_ACCOUNT_CUT_EVENTS} ace
             join {TBL_ACCOUNTS} a on a.id = ace.account_id
             {where}
@@ -191,9 +191,12 @@ def _load_cut_events_by_account(conn, until_date: str | None = None) -> dict[str
         )
         rows = cur.fetchall()
 
-    grouped: dict[str, list[date]] = {}
-    for account_name, cut_date in rows:
-        grouped.setdefault(account_name, []).append(_coerce_date(cut_date))
+    grouped: dict[str, list[dict]] = {}
+    for account_name, cut_date, created_at in rows:
+        grouped.setdefault(account_name, []).append({
+            "cut_date": _coerce_date(cut_date),
+            "created_at": _coerce_datetime(created_at),
+        })
     return grouped
 
 
@@ -212,6 +215,22 @@ def _coerce_date(value) -> date | None:
     return date.fromisoformat(str(value)[:10])
 
 
+def _coerce_datetime(value) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if hasattr(value, "isoformat") and not isinstance(value, str):
+        try:
+            text = value.isoformat()
+            return datetime.fromisoformat(text[:19])
+        except Exception:
+            pass
+    if isinstance(value, str):
+        return datetime.fromisoformat(value[:19])
+    return datetime.fromisoformat(str(value)[:19])
+
+
 def _installment_anchor_date(purchase_date, created_at) -> date:
     return _coerce_date(purchase_date) or _coerce_date(created_at) or date.today()
 
@@ -221,16 +240,17 @@ def _installment_first_payment_month(
     account_name: str,
     account_type: str | None,
     cutoff_day: int | None,
-    cut_events_by_account: dict[str, list[date]],
+    cut_events_by_account: dict[str, list[dict]],
 ) -> str:
     anchor_date = _coerce_date(purchase_date) or date.today()
     purchase_month = anchor_date.strftime("%Y-%m")
     if not _is_card_account_type(account_type):
         return purchase_month
 
-    cut_dates = cut_events_by_account.get(account_name, [])
+    cut_events = cut_events_by_account.get(account_name, [])
     latest_cut = None
-    for cut_date in cut_dates:
+    for event in cut_events:
+        cut_date = event["cut_date"]
         if cut_date <= anchor_date:
             latest_cut = cut_date
         else:
@@ -273,28 +293,41 @@ def _installment_active_in_month(first_payment_month: str, end_month: str | None
     return _month_index(first_payment_month) <= month_idx <= _month_index(end_month)
 
 
-def _report_month_for_expense(expense_date, account_name: str, account_type: str | None, cut_events_by_account: dict[str, list[date]]) -> str:
+def _report_month_for_expense(expense_date, expense_created_at, account_name: str, account_type: str | None, cut_events_by_account: dict[str, list[dict]]) -> str:
     expense_month = expense_date.strftime("%Y-%m")
     if not _is_card_account_type(account_type):
         return expense_month
 
-    cut_dates = cut_events_by_account.get(account_name, [])
-    latest_cut = None
-    for cut_date in cut_dates:
+    expense_created_dt = _coerce_datetime(expense_created_at)
+    cut_events = cut_events_by_account.get(account_name, [])
+    latest_cut_event = None
+    for event in cut_events:
+        cut_date = event["cut_date"]
         if cut_date <= expense_date:
-            latest_cut = cut_date
+            latest_cut_event = event
         else:
             break
 
-    if latest_cut and latest_cut.strftime("%Y-%m") == expense_month and expense_date > latest_cut:
+    if not latest_cut_event:
+        return expense_month
+
+    latest_cut_date = latest_cut_event["cut_date"]
+    latest_cut_created_at = latest_cut_event.get("created_at")
+    is_same_day_post_cut = (
+        expense_date == latest_cut_date
+        and expense_created_dt is not None
+        and latest_cut_created_at is not None
+        and expense_created_dt > latest_cut_created_at
+    )
+    if latest_cut_date and latest_cut_date.strftime("%Y-%m") == expense_month and (expense_date > latest_cut_date or is_same_day_post_cut):
         return _shift_month(expense_month, 2 if _uses_two_month_post_cutover(account_name) else 1)
     return expense_month
 
 
 def _list_regular_expense_entries(conn, month: str) -> list[dict]:
     month_start, next_month = _month_range(month)
-    previous_month = _shift_month(month, -1)
-    previous_month_start, _ = _month_range(previous_month)
+    lookback_month = _shift_month(month, -2)
+    lookback_month_start, _ = _month_range(lookback_month)
     cut_events_by_account = _load_cut_events_by_account(conn, until_date=next_month)
 
     with conn.cursor() as cur:
@@ -318,13 +351,13 @@ def _list_regular_expense_entries(conn, month: str) -> list[dict]:
             join {TBL_EXPENSE_CATEGORIES} c on c.id = e.category_id
             where e.expense_date >= %s and e.expense_date < %s
             """,
-            (previous_month_start, next_month),
+            (lookback_month_start, next_month),
         )
         rows = cur.fetchall()
 
     items = []
     for row in rows:
-        report_month = _report_month_for_expense(row[1], row[4], row[5], cut_events_by_account)
+        report_month = _report_month_for_expense(row[1], row[10], row[4], row[5], cut_events_by_account)
         if report_month != month:
             continue
         items.append(
