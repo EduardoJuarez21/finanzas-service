@@ -166,6 +166,11 @@ def _is_card_account_type(account_type: str | None) -> bool:
     return account_type in {"credit", "store_card"}
 
 
+def _uses_two_month_post_cutover(account_name: str | None) -> bool:
+    normalized = (account_name or "").strip().lower()
+    return normalized in {"heb", "stori"}
+
+
 def _load_cut_events_by_account(conn, until_date: str | None = None) -> dict[str, list[date]]:
     where = ""
     params: list = []
@@ -282,7 +287,7 @@ def _report_month_for_expense(expense_date, account_name: str, account_type: str
             break
 
     if latest_cut and latest_cut.strftime("%Y-%m") == expense_month and expense_date > latest_cut:
-        return _shift_month(expense_month, 1)
+        return _shift_month(expense_month, 2 if _uses_two_month_post_cutover(account_name) else 1)
     return expense_month
 
 
