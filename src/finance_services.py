@@ -1265,6 +1265,10 @@ def _serialize_installment_plan_row(
     }
 
 
+def _installment_plan_has_pending_balance(item: dict) -> bool:
+    return int(item.get("months_remaining") or 0) > 0 and float(item.get("pending_total") or 0) > 0
+
+
 def list_finance_installment_plans(active_only: bool = False) -> list[dict]:
     with _db_conn() as conn:
         if conn is None:
@@ -1272,10 +1276,13 @@ def list_finance_installment_plans(active_only: bool = False) -> list[dict]:
         rows = _fetch_installment_plan_rows(conn, active_only=active_only)
         cut_events_by_account = _load_cut_events_by_account(conn)
 
-    return [
+    items = [
         _serialize_installment_plan_row(row, cut_events_by_account)
         for row in rows
     ]
+    if active_only:
+        items = [item for item in items if _installment_plan_has_pending_balance(item)]
+    return items
 
 
 def _resolve_installment_end_month(
@@ -1757,6 +1764,10 @@ def get_finance_dashboard(month: str) -> dict:
         active_installment_plans = [
             _serialize_installment_plan_row(row, cut_events_by_account, reference_month=month_value)
             for row in _fetch_installment_plan_rows(conn, active_only=True)
+        ]
+        active_installment_plans = [
+            item for item in active_installment_plans
+            if _installment_plan_has_pending_balance(item)
         ]
 
         with conn.cursor() as cur:
