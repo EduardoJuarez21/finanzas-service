@@ -319,8 +319,11 @@ def _report_month_for_expense(expense_date, expense_created_at, account_name: st
         and latest_cut_created_at is not None
         and expense_created_dt > latest_cut_created_at
     )
-    if latest_cut_date and latest_cut_date.strftime("%Y-%m") == expense_month and (expense_date > latest_cut_date or is_same_day_post_cut):
-        return _shift_month(expense_month, 2 if _uses_two_month_post_cutover(account_name) else 1)
+    is_post_cut = expense_date > latest_cut_date or is_same_day_post_cut
+    cut_month = latest_cut_date.strftime("%Y-%m")
+    cut_cycle_months = {cut_month, _shift_month(cut_month, 1)}
+    if latest_cut_date and is_post_cut and expense_month in cut_cycle_months:
+        return _shift_month(cut_month, 2 if _uses_two_month_post_cutover(account_name) else 1)
     return expense_month
 
 
