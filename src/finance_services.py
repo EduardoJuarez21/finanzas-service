@@ -309,7 +309,9 @@ def _report_month_for_expense(expense_date, expense_created_at, account_name: st
             break
 
     if not latest_cut_event:
-        return _shift_month(expense_month, 1)
+        if _uses_two_month_post_cutover(account_name):
+            return _shift_month(expense_month, 1)
+        return expense_month
 
     latest_cut_date = latest_cut_event["cut_date"]
     latest_cut_created_at = latest_cut_event.get("created_at")
