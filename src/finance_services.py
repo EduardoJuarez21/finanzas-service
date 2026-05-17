@@ -389,6 +389,48 @@ def _list_regular_expense_entries(conn, month: str) -> list[dict]:
     return items
 
 
+def _list_recent_captured_expense_entries(conn, month: str, limit: int = 10) -> list[dict]:
+    month_start, next_month = _month_range(month)
+    limit_value = max(1, min(int(limit or 10), 100))
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            select
+              e.id,
+              e.expense_date,
+              e.amount,
+              e.description,
+              a.name as account_name,
+              c.name as category_name,
+              e.created_at
+            from {TBL_EXPENSES} e
+            join {TBL_ACCOUNTS} a on a.id = e.account_id
+            join {TBL_EXPENSE_CATEGORIES} c on c.id = e.category_id
+            where e.expense_date >= %s and e.expense_date < %s
+            order by e.created_at desc, e.id desc
+            limit %s
+            """,
+            (month_start, next_month, limit_value),
+        )
+        rows = cur.fetchall()
+
+    return [
+        {
+            "id": row[0],
+            "date": _date_to_iso(row[1]),
+            "created_at": _datetime_to_iso(row[6]),
+            "amount": float(row[2]),
+            "description": row[3],
+            "account_name": row[4],
+            "category_name": row[5],
+            "entry_type": "expense",
+            "payment_status": None,
+        }
+        for row in rows
+    ]
+
+
 def _list_fixed_expense_entries(conn, month: str) -> list[dict]:
     with conn.cursor() as cur:
         cur.execute(
@@ -1765,6 +1807,7 @@ def get_finance_dashboard(month: str) -> dict:
                 "recent_expenses": [],
             }
         monthly_expenses = _list_monthly_expense_entries(conn, month_value)
+        recent_expenses = _list_recent_captured_expense_entries(conn, month_value, limit=10)
         cut_events_by_account = _load_cut_events_by_account(conn)
         active_installment_plans = [
             _serialize_installment_plan_row(row, cut_events_by_account, reference_month=month_value)
@@ -1839,29 +1882,6 @@ def get_finance_dashboard(month: str) -> dict:
         {"category_name": name, "amount": amount}
         for name, amount in sorted(expense_by_category_totals.items(), key=lambda item: (-item[1], item[0]))
     ]
-    recent_captured_expenses = sorted(
-        (item for item in monthly_expenses if item.get("entry_type") == "expense"),
-        key=lambda item: (
-            item.get("created_at") or "",
-            str(item.get("id") or ""),
-        ),
-        reverse=True,
-    )
-    recent_expenses = [
-        {
-            "id": item["id"],
-            "date": item["date"],
-            "created_at": item.get("created_at"),
-            "amount": item["amount"],
-            "description": item["description"],
-            "account_name": item["account_name"],
-            "category_name": item["category_name"],
-            "entry_type": item.get("entry_type"),
-            "payment_status": item.get("payment_status"),
-        }
-        for item in recent_captured_expenses[:10]
-    ]
-
     balance = total_income - total_expense - installment_commitment
     return {
         "month": month_value,
