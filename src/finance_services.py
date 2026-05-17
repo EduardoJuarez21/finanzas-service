@@ -389,9 +389,15 @@ def _list_regular_expense_entries(conn, month: str) -> list[dict]:
     return items
 
 
-def _list_recent_captured_expense_entries(conn, month: str, limit: int = 10) -> list[dict]:
+def _list_recent_captured_expense_entries(
+    conn,
+    month: str,
+    limit: int = 10,
+    cut_events_by_account: dict[str, list[dict]] | None = None,
+) -> list[dict]:
     month_start, next_month = _month_range(month)
     limit_value = max(1, min(int(limit or 10), 100))
+    cut_events = cut_events_by_account or _load_cut_events_by_account(conn, until_date=next_month)
 
     with conn.cursor() as cur:
         cur.execute(
@@ -402,6 +408,7 @@ def _list_recent_captured_expense_entries(conn, month: str, limit: int = 10) -> 
               e.amount,
               e.description,
               a.name as account_name,
+              a.account_type,
               c.name as category_name,
               e.created_at
             from {TBL_EXPENSES} e
@@ -415,20 +422,25 @@ def _list_recent_captured_expense_entries(conn, month: str, limit: int = 10) -> 
         )
         rows = cur.fetchall()
 
-    return [
-        {
-            "id": row[0],
-            "date": _date_to_iso(row[1]),
-            "created_at": _datetime_to_iso(row[6]),
-            "amount": float(row[2]),
-            "description": row[3],
-            "account_name": row[4],
-            "category_name": row[5],
-            "entry_type": "expense",
-            "payment_status": None,
-        }
-        for row in rows
-    ]
+    items = []
+    for row in rows:
+        report_month = _report_month_for_expense(row[1], row[7], row[4], row[5], cut_events)
+        items.append(
+            {
+                "id": row[0],
+                "date": _date_to_iso(row[1]),
+                "created_at": _datetime_to_iso(row[7]),
+                "amount": float(row[2]),
+                "description": row[3],
+                "account_name": row[4],
+                "category_name": row[6],
+                "entry_type": "expense",
+                "payment_status": None,
+                "report_month": report_month,
+                "is_shifted_by_cut": report_month != month,
+            }
+        )
+    return items
 
 
 def _list_fixed_expense_entries(conn, month: str) -> list[dict]:
@@ -1806,9 +1818,14 @@ def get_finance_dashboard(month: str) -> dict:
                 "expense_by_category": [],
                 "recent_expenses": [],
             }
-        monthly_expenses = _list_monthly_expense_entries(conn, month_value)
-        recent_expenses = _list_recent_captured_expense_entries(conn, month_value, limit=10)
         cut_events_by_account = _load_cut_events_by_account(conn)
+        monthly_expenses = _list_monthly_expense_entries(conn, month_value)
+        recent_expenses = _list_recent_captured_expense_entries(
+            conn,
+            month_value,
+            limit=10,
+            cut_events_by_account=cut_events_by_account,
+        )
         active_installment_plans = [
             _serialize_installment_plan_row(row, cut_events_by_account, reference_month=month_value)
             for row in _fetch_installment_plan_rows(conn, active_only=True)
