@@ -383,6 +383,7 @@ def _list_regular_expense_entries(conn, month: str) -> list[dict]:
                 "payment_status": None,
                 "paid_date": None,
                 "report_month": report_month,
+                "is_shifted_by_cut": report_month != row[1].strftime("%Y-%m"),
                 "is_virtual": bool(row[11]),
             }
         )
@@ -617,7 +618,24 @@ def list_finance_expenses(month: str | None = None, limit: int = 100) -> list[di
         with _db_conn() as conn:
             if conn is None:
                 return []
-            return _list_monthly_expense_entries(conn, month_value)[:limit_value]
+            cut_events_by_account = _load_cut_events_by_account(conn)
+            monthly_items = _list_monthly_expense_entries(conn, month_value)
+            monthly_expense_ids = {
+                item["id"]
+                for item in monthly_items
+                if item.get("entry_type") == "expense"
+            }
+            captured_shifted_items = [
+                item
+                for item in _list_recent_captured_expense_entries(
+                    conn,
+                    month_value,
+                    limit=limit_value,
+                    cut_events_by_account=cut_events_by_account,
+                )
+                if item.get("is_shifted_by_cut") and item["id"] not in monthly_expense_ids
+            ]
+            return _sort_expense_entries(monthly_items + captured_shifted_items)[:limit_value]
 
     with _db_conn() as conn:
         if conn is None:
