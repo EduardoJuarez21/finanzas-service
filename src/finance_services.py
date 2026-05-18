@@ -14,6 +14,7 @@ TBL_FIXED_EXPENSE_PAYMENTS = f"{SCHEMA}.fixed_expense_payments"
 TBL_INSTALLMENT_PLANS = f"{SCHEMA}.installment_plans"
 TBL_ACCOUNT_CUT_EVENTS = f"{SCHEMA}.account_cut_events"
 TBL_FIXED_INCOMES = f"{SCHEMA}.fixed_incomes"
+TBL_ACCOUNT_PAYMENT_STATUSES = f"{SCHEMA}.account_payment_statuses"
 
 
 def _require_month(month: str | None) -> str:
@@ -1216,6 +1217,103 @@ def create_finance_account_cut_event(payload: dict) -> dict:
         "account_name": account_name,
         "cut_date": _date_to_iso(row[1]),
         "created_at": _datetime_to_iso(row[2]),
+    }
+
+
+def _ensure_account_payment_statuses_table(conn) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            create table if not exists {TBL_ACCOUNT_PAYMENT_STATUSES} (
+              id serial primary key,
+              account_id integer not null references {TBL_ACCOUNTS}(id),
+              payment_month text not null,
+              status text not null default 'pending' check (status in ('pending', 'paid')),
+              paid_date date,
+              updated_at timestamptz not null default now(),
+              unique(account_id, payment_month)
+            )
+            """
+        )
+        conn.commit()
+
+
+def list_finance_account_payment_statuses(month: str) -> list[dict]:
+    month_value = _require_month(month)
+    with _db_conn() as conn:
+        if conn is None:
+            return []
+        _ensure_account_payment_statuses_table(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                select aps.id, a.name, aps.payment_month, aps.status, aps.paid_date, aps.updated_at
+                from {TBL_ACCOUNT_PAYMENT_STATUSES} aps
+                join {TBL_ACCOUNTS} a on a.id = aps.account_id
+                where aps.payment_month = %s
+                order by a.name asc
+                """,
+                (month_value,),
+            )
+            rows = cur.fetchall()
+
+    return [
+        {
+            "id": row[0],
+            "account_name": row[1],
+            "payment_month": row[2],
+            "status": row[3],
+            "paid_date": _date_to_iso(row[4]),
+            "updated_at": _datetime_to_iso(row[5]),
+        }
+        for row in rows
+    ]
+
+
+def upsert_finance_account_payment_status(payload: dict) -> dict:
+    account_name = (payload.get("account_name") or "").strip()
+    payment_month = _require_month(payload.get("payment_month"))
+    payment_status = _require_choice(payload.get("status"), "status", {"pending", "paid"})
+    paid_date = _optional_date(payload.get("paid_date"))
+
+    if not account_name:
+        raise ValueError("Falta account_name.")
+    if payment_status == "paid" and paid_date is None:
+        paid_date = date.today().isoformat()
+    if payment_status == "pending":
+        paid_date = None
+
+    account_id = _lookup_id_by_name(TBL_ACCOUNTS, account_name)
+
+    with _db_conn() as conn:
+        if conn is None:
+            raise ValueError("DATABASE_URL not set")
+        _ensure_account_payment_statuses_table(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                insert into {TBL_ACCOUNT_PAYMENT_STATUSES}
+                (account_id, payment_month, status, paid_date, updated_at)
+                values (%s, %s, %s, %s, now())
+                on conflict (account_id, payment_month)
+                do update
+                   set status = excluded.status,
+                       paid_date = excluded.paid_date,
+                       updated_at = now()
+                returning id, payment_month, status, paid_date, updated_at
+                """,
+                (account_id, payment_month, payment_status, paid_date),
+            )
+            row = cur.fetchone()
+            conn.commit()
+
+    return {
+        "id": row[0],
+        "account_name": account_name,
+        "payment_month": row[1],
+        "status": row[2],
+        "paid_date": _date_to_iso(row[3]),
+        "updated_at": _datetime_to_iso(row[4]),
     }
 
 

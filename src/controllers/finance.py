@@ -17,6 +17,7 @@ from src.finance_services import (
     deactivate_finance_fixed_income,
     get_finance_dashboard,
     get_finance_yearly_summary,
+    list_finance_account_payment_statuses,
     list_finance_catalogs,
     list_finance_account_cut_events,
     list_finance_expenses,
@@ -25,6 +26,7 @@ from src.finance_services import (
     list_finance_incomes,
     list_finance_installment_plans,
     update_finance_income,
+    upsert_finance_account_payment_status,
     upsert_finance_account_settings,
     upsert_finance_fixed_expense_payment,
 )
@@ -144,6 +146,23 @@ def finance_account_cuts():
 def finance_fixed_expense_status():
     try:
         item = upsert_finance_fixed_expense_payment(_json_payload())
+    except ValueError as exc:
+        return jsonify({"status": "error", "error": str(exc)}), 400
+    return jsonify({"status": "ok", "item": item}), 200
+
+
+@finance_bp.route("/finance/account-payments", methods=["GET", "POST"])
+def finance_account_payments():
+    if request.method == "GET":
+        month = (request.args.get("month") or "").strip()
+        try:
+            items = list_finance_account_payment_statuses(month)
+        except ValueError as exc:
+            return jsonify({"status": "error", "error": str(exc)}), 400
+        return jsonify({"status": "ok" if items else "empty", "items": items}), 200
+
+    try:
+        item = upsert_finance_account_payment_status(_json_payload())
     except ValueError as exc:
         return jsonify({"status": "error", "error": str(exc)}), 400
     return jsonify({"status": "ok", "item": item}), 200
