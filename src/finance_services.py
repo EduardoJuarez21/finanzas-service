@@ -184,7 +184,7 @@ def _load_cut_events_by_account(conn, until_date: str | None = None) -> dict[str
             f"""
             select a.name, ace.cut_date, ace.created_at
             from {TBL_ACCOUNT_CUT_EVENTS} ace
-            join {TBL_ACCOUNTS} a on a.id = ace.account_id
+            join {TBL_ACCOUNTS} a on a.id = ace.account_id and a.is_active = true
             {where}
             order by a.name asc, ace.cut_date asc, ace.id asc
             """,
@@ -353,7 +353,7 @@ def _list_regular_expense_entries(conn, month: str) -> list[dict]:
               e.created_at,
               a.is_virtual
             from {TBL_EXPENSES} e
-            join {TBL_ACCOUNTS} a on a.id = e.account_id
+            join {TBL_ACCOUNTS} a on a.id = e.account_id and a.is_active = true
             join {TBL_EXPENSE_CATEGORIES} c on c.id = e.category_id
             where e.expense_date >= %s and e.expense_date < %s
             """,
@@ -414,7 +414,7 @@ def _list_recent_captured_expense_entries(
               c.name as category_name,
               e.created_at
             from {TBL_EXPENSES} e
-            join {TBL_ACCOUNTS} a on a.id = e.account_id
+            join {TBL_ACCOUNTS} a on a.id = e.account_id and a.is_active = true
             join {TBL_EXPENSE_CATEGORIES} c on c.id = e.category_id
             where e.expense_date >= %s and e.expense_date < %s
             order by e.created_at desc, e.id desc
@@ -464,7 +464,7 @@ def _list_fixed_expense_entries(conn, month: str) -> list[dict]:
               f.created_at,
               a.is_virtual
             from {TBL_FIXED_EXPENSES} f
-            join {TBL_ACCOUNTS} a on a.id = f.account_id
+            join {TBL_ACCOUNTS} a on a.id = f.account_id and a.is_active = true
             join {TBL_EXPENSE_CATEGORIES} c on c.id = f.category_id
             left join {TBL_FIXED_EXPENSE_PAYMENTS} fp
               on fp.fixed_expense_id = f.id
@@ -657,7 +657,7 @@ def list_finance_expenses(month: str | None = None, limit: int = 100) -> list[di
                   e.notes,
                   e.created_at
                 from {TBL_EXPENSES} e
-                join {TBL_ACCOUNTS} a on a.id = e.account_id
+            join {TBL_ACCOUNTS} a on a.id = e.account_id and a.is_active = true
                 join {TBL_EXPENSE_CATEGORIES} c on c.id = e.category_id
                 order by e.expense_date desc, e.id desc
                 limit %s
@@ -880,7 +880,7 @@ def list_finance_fixed_incomes(active_only: bool = True) -> list[dict]:
                 select fi.id, fi.name, fi.amount, s.name as source_name, fi.is_active, fi.created_at, fi.kind, fi.account_id, a.name as account_name
                 from {TBL_FIXED_INCOMES} fi
                 join {TBL_INCOME_SOURCES} s on s.id = fi.income_source_id
-                left join {TBL_ACCOUNTS} a on a.id = fi.account_id
+                left join {TBL_ACCOUNTS} a on a.id = fi.account_id and a.is_active = true
                 {where}
                 order by fi.name asc
                 """,
@@ -1046,7 +1046,7 @@ def list_finance_fixed_expenses(month: str | None = None) -> list[dict]:
                   f.is_active,
                   f.created_at
                 from {TBL_FIXED_EXPENSES} f
-                join {TBL_ACCOUNTS} a on a.id = f.account_id
+            join {TBL_ACCOUNTS} a on a.id = f.account_id and a.is_active = true
                 join {TBL_EXPENSE_CATEGORIES} c on c.id = f.category_id
                 {payment_join}
                 where f.is_active = true
@@ -1165,7 +1165,7 @@ def list_finance_account_cut_events(account_name: str | None = None, limit: int 
                   ace.cut_date,
                   ace.created_at
                 from {TBL_ACCOUNT_CUT_EVENTS} ace
-                join {TBL_ACCOUNTS} a on a.id = ace.account_id
+                join {TBL_ACCOUNTS} a on a.id = ace.account_id and a.is_active = true
                 {where}
                 order by ace.cut_date desc, ace.id desc
                 limit %s
@@ -1249,7 +1249,7 @@ def list_finance_account_payment_statuses(month: str) -> list[dict]:
                 f"""
                 select aps.id, a.name, aps.payment_month, aps.status, aps.paid_date, aps.updated_at
                 from {TBL_ACCOUNT_PAYMENT_STATUSES} aps
-                join {TBL_ACCOUNTS} a on a.id = aps.account_id
+                join {TBL_ACCOUNTS} a on a.id = aps.account_id and a.is_active = true
                 where aps.payment_month = %s
                 order by a.name asc
                 """,
@@ -1391,7 +1391,7 @@ def _fetch_installment_plan_rows(conn, active_only: bool = False):
               a.account_type,
               a.cutoff_day
             from {TBL_INSTALLMENT_PLANS} p
-            join {TBL_ACCOUNTS} a on a.id = p.account_id
+            join {TBL_ACCOUNTS} a on a.id = p.account_id and a.is_active = true
             left join {TBL_EXPENSE_CATEGORIES} c on c.id = p.category_id
             {where}
             order by p.status asc, p.created_at desc
@@ -1589,7 +1589,7 @@ def update_finance_installment_plan(plan_id: int, payload: dict) -> dict:
                        p.months_remaining, p.pending_total, p.purchase_date, p.status,
                        p.created_at, p.updated_at, p.end_month, c.name
                 from {TBL_INSTALLMENT_PLANS} p
-                join {TBL_ACCOUNTS} a on a.id = p.account_id
+                join {TBL_ACCOUNTS} a on a.id = p.account_id and a.is_active = true
                 left join {TBL_EXPENSE_CATEGORIES} c on c.id = p.category_id
                 where p.id = %s
                 """,
