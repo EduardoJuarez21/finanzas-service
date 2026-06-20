@@ -169,7 +169,7 @@ def _is_card_account_type(account_type: str | None) -> bool:
 
 def _uses_two_month_post_cutover(account_name: str | None) -> bool:
     normalized = (account_name or "").strip().lower()
-    return normalized in {"heb", "stori"}
+    return normalized == "stori"
 
 
 def _load_cut_events_by_account(conn, until_date: str | None = None) -> dict[str, list[dict]]:
